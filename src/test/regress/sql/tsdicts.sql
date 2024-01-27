@@ -251,3 +251,10 @@ CREATE TEXT SEARCH DICTIONARY tsdict_case
 	"DictFile" = ispell_sample,
 	"AffFile" = ispell_sample
 );
+
+-- test duplicate token type
+CREATE TEXT SEARCH CONFIGURATION dup_ispell_tst (COPY=english);
+
+ALTER TEXT SEARCH CONFIGURATION dup_ispell_tst ALTER MAPPING FOR word, word WITH ispell;
+
+ALTER TEXT SEARCH CONFIGURATION dup_ispell_tst DROP MAPPING IF EXISTS FOR hello;

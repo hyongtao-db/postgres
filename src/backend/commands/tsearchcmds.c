@@ -1194,20 +1194,19 @@ AlterTSConfiguration(AlterTSConfigurationStmt *stmt)
 /*
  * Translate a list of token type names to an array of token type numbers
  */
-static int *
-getTokenTypes(Oid prsId, List *tokennames)
+static List *
+getTokenTypes(Oid prsId, AlterTSConfigurationStmt *stmt)
 {
 	TSParserCacheEntry *prs = lookup_ts_parser_cache(prsId);
 	LexDescr   *list;
-	int		   *res,
-				i,
-				ntoken;
+	List	   *res = NIL;
+	int        ntoken;
 	ListCell   *tn;
+   List       *tokennames = stmt->tokentype;
 
 	ntoken = list_length(tokennames);
 	if (ntoken == 0)
-		return NULL;
-	res = (int *) palloc(sizeof(int) * ntoken);
+		return NIL;
 
 	if (!OidIsValid(prs->lextypeOid))
 		elog(ERROR, "method lextype isn't defined for text search parser %u",
@@ -1217,7 +1216,6 @@ getTokenTypes(Oid prsId, List *tokennames)
 	list = (LexDescr *) DatumGetPointer(OidFunctionCall1(prs->lextypeOid,
 														 (Datum) 0));
 
-	i = 0;
 	foreach(tn, tokennames)
 	{
 		String	   *val = lfirst_node(String, tn);
@@ -1229,18 +1227,26 @@ getTokenTypes(Oid prsId, List *tokennames)
 		{
 			if (strcmp(strVal(val), list[j].alias) == 0)
 			{
-				res[i] = list[j].lexid;
+				res = list_append_unique_int(res, list[j].lexid);
 				found = true;
 				break;
 			}
 			j++;
 		}
 		if (!found)
-			ereport(ERROR,
+		{
+			if (!stmt->missing_ok)
+				ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("token type \"%s\" does not exist",
-							strVal(val))));
-		i++;
+						errmsg("token type \"%s\" does not exist",
+						strVal(val))));
+			else
+			{
+				ereport(NOTICE,
+					(errmsg("token type \"%s\" does not exist, skipping",
+						strVal(val))));
+			}
+		}
 	}
 
 	return res;
@@ -1261,8 +1267,8 @@ MakeConfigurationMapping(AlterTSConfigurationStmt *stmt,
 	int			i;
 	int			j;
 	Oid			prsId;
-	int		   *tokens,
-				ntoken;
+	List		*tokens = NIL;
+	int			ntoken;
 	Oid		   *dictIds;
 	int			ndict;
 	ListCell   *c;
@@ -1272,15 +1278,15 @@ MakeConfigurationMapping(AlterTSConfigurationStmt *stmt,
 	cfgId = tsform->oid;
 	prsId = tsform->cfgparser;
 
-	tokens = getTokenTypes(prsId, stmt->tokentype);
-	ntoken = list_length(stmt->tokentype);
+	tokens = getTokenTypes(prsId, stmt);
+	ntoken = list_length(tokens);
 
 	if (stmt->override)
 	{
 		/*
 		 * delete maps for tokens if they exist and command was ALTER
 		 */
-		for (i = 0; i < ntoken; i++)
+		foreach(c, tokens)
 		{
 			ScanKeyInit(&skey[0],
 						Anum_pg_ts_config_map_mapcfg,
@@ -1289,7 +1295,7 @@ MakeConfigurationMapping(AlterTSConfigurationStmt *stmt,
 			ScanKeyInit(&skey[1],
 						Anum_pg_ts_config_map_maptokentype,
 						BTEqualStrategyNumber, F_INT4EQ,
-						Int32GetDatum(tokens[i]));
+						Int32GetDatum(lfirst_int(c)));
 
 			scan = systable_beginscan(relMap, TSConfigMapIndexId, true,
 									  NULL, 2, skey);
@@ -1346,9 +1352,9 @@ MakeConfigurationMapping(AlterTSConfigurationStmt *stmt,
 			{
 				bool		tokmatch = false;
 
-				for (j = 0; j < ntoken; j++)
+				foreach(c, tokens)
 				{
-					if (cfgmap->maptokentype == tokens[j])
+					if (cfgmap->maptokentype == lfirst_int(c))
 					{
 						tokmatch = true;
 						break;
@@ -1401,7 +1407,7 @@ MakeConfigurationMapping(AlterTSConfigurationStmt *stmt,
 		/*
 		 * Insertion of new entries
 		 */
-		for (i = 0; i < ntoken; i++)
+		foreach(c, tokens)
 		{
 			for (j = 0; j < ndict; j++)
 			{
@@ -1411,7 +1417,7 @@ MakeConfigurationMapping(AlterTSConfigurationStmt *stmt,
 					   slot[slotCount]->tts_tupleDescriptor->natts * sizeof(bool));
 
 				slot[slotCount]->tts_values[Anum_pg_ts_config_map_mapcfg - 1] = ObjectIdGetDatum(cfgId);
-				slot[slotCount]->tts_values[Anum_pg_ts_config_map_maptokentype - 1] = Int32GetDatum(tokens[i]);
+				slot[slotCount]->tts_values[Anum_pg_ts_config_map_maptokentype - 1] = Int32GetDatum(lfirst_int(c));
 				slot[slotCount]->tts_values[Anum_pg_ts_config_map_mapseqno - 1] = Int32GetDatum(j + 1);
 				slot[slotCount]->tts_values[Anum_pg_ts_config_map_mapdict - 1] = ObjectIdGetDatum(dictIds[j]);
 
@@ -1455,23 +1461,18 @@ DropConfigurationMapping(AlterTSConfigurationStmt *stmt,
 	ScanKeyData skey[2];
 	SysScanDesc scan;
 	HeapTuple	maptup;
-	int			i;
 	Oid			prsId;
-	int		   *tokens;
+	List		*tokens = NIL;
 	ListCell   *c;
 
 	tsform = (Form_pg_ts_config) GETSTRUCT(tup);
 	cfgId = tsform->oid;
 	prsId = tsform->cfgparser;
 
-	tokens = getTokenTypes(prsId, stmt->tokentype);
+	tokens = getTokenTypes(prsId, stmt);
 
-	i = 0;
-	foreach(c, stmt->tokentype)
+	foreach(c, tokens)
 	{
-		String	   *val = lfirst_node(String, c);
-		bool		found = false;
-
 		ScanKeyInit(&skey[0],
 					Anum_pg_ts_config_map_mapcfg,
 					BTEqualStrategyNumber, F_OIDEQ,
@@ -1479,7 +1480,7 @@ DropConfigurationMapping(AlterTSConfigurationStmt *stmt,
 		ScanKeyInit(&skey[1],
 					Anum_pg_ts_config_map_maptokentype,
 					BTEqualStrategyNumber, F_INT4EQ,
-					Int32GetDatum(tokens[i]));
+					Int32GetDatum(lfirst_int(c)));
 
 		scan = systable_beginscan(relMap, TSConfigMapIndexId, true,
 								  NULL, 2, skey);
@@ -1487,29 +1488,9 @@ DropConfigurationMapping(AlterTSConfigurationStmt *stmt,
 		while (HeapTupleIsValid((maptup = systable_getnext(scan))))
 		{
 			CatalogTupleDelete(relMap, &maptup->t_self);
-			found = true;
 		}
 
 		systable_endscan(scan);
-
-		if (!found)
-		{
-			if (!stmt->missing_ok)
-			{
-				ereport(ERROR,
-						(errcode(ERRCODE_UNDEFINED_OBJECT),
-						 errmsg("mapping for token type \"%s\" does not exist",
-								strVal(val))));
-			}
-			else
-			{
-				ereport(NOTICE,
-						(errmsg("mapping for token type \"%s\" does not exist, skipping",
-								strVal(val))));
-			}
-		}
-
-		i++;
 	}
 
 	EventTriggerCollectAlterTSConfig(stmt, cfgId, NULL, 0);
